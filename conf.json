@@ -1,0 +1,25 @@
+{
+    "vars": {
+        "shuffle": true,
+        "timeout": "10s",
+        "keepalive": true,
+        "sampling": 50,
+        "step": 200,
+        "total": 300000,
+        "retOks": [
+        ],
+        "filters": [
+        ],
+        "ips": {
+            "demo": [
+                "127.0.0.1:8080"
+            ]
+        }
+    },
+    "rates": {
+        // key -> value, key: from api log, value: qps
+         "demo": {
+            "check": 4000
+        }
+    }
+}
