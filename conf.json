@@ -5,21 +5,19 @@
         "keepalive": true,
         "sampling": 50,
         "step": 200,
-        "total": 300000,
+        "total": 10000,
         "retOks": [
+            "{\"ret\":1,",
+            "{\"ret\":1}"
         ],
         "filters": [
         ],
-        "ips": {
-            "demo": [
-                "127.0.0.1:8080"
-            ]
-        }
+        "ips": [
+            "127.0.0.1:8325"
+        ]
     },
     "rates": {
         // key -> value, key: from api log, value: qps
-         "demo": {
-            "check": 4000
-        }
+        "c/a": 10
     }
 }

@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -26,26 +27,17 @@ import (
 
 type Conf struct {
 	Vars struct {
-		Shuffle   bool
-		Timeout   string
-		Keepalive bool
-		Step      int
-		Total     int
-		Sampling  int
-		RetOks    []string
-		Filters   []string
-		Ips       map[string][]string
+		Shuffle   bool     // 接口调用是否打乱
+		Timeout   string   // http请求超时
+		Keepalive bool     // http是否保持长连接
+		Step      int      // 精度，越大精度越高
+		Total     int      // 从日志里解析单个接口最大个数
+		Sampling  int      // 输出日志采样
+		RetOks    []string // 代表接口调用成功
+		Filters   []string // 过滤掉的接口返回
+		Ips       []string // 压测机ip列表
 	}
-	Rates map[string]map[string]int
-}
-
-type ModuleAction struct {
-	Module string
-	Action string
-}
-
-func (ma ModuleAction) String() string {
-	return ma.Module + "/" + ma.Action
+	Rates map[string]int
 }
 
 type CODE string
@@ -63,11 +55,11 @@ const (
 
 var (
 	conf *Conf
-	reqs = make(map[ModuleAction][][]byte)
+	reqs = make(map[string][][]byte)
 
 	codes = [...]CODE{OK, TIMEOUT, _5XX, _4XX, _3XX, LOGIC, OTHER, TOTAL}
-	cnts  = make(map[CODE]map[ModuleAction]*uint32)
-	chs   = make(map[ModuleAction]chan []byte)
+	cnts  = make(map[CODE]map[string]*uint32)
+	chs   = make(map[string]chan []byte)
 
 	client *http.Client // reuse for better
 )
@@ -96,8 +88,10 @@ func shuffle(d [][]byte) {
 func loadData(f string) {
 	log.Println("begin load api log file")
 
+	r := regexp.MustCompile(`^{"lv":"INFO".+?"rq":"(.+?)->(.+?)".+?"io":"orig_purifier","data":({.+?})`)
+
 	fs := strings.Split(f, ",")
-	reqss := make([]map[ModuleAction][][]byte, len(fs))
+	reqss := make([]map[string][][]byte, len(fs))
 	var wg sync.WaitGroup
 	for fpos := range fs {
 		wg.Add(1)
@@ -119,54 +113,25 @@ func loadData(f string) {
 				} else if err != nil {
 					log.Fatalf("read api log file: %s, error: %v\n", f, err)
 				}
-				line = bytes.TrimRight(line, "\n")
-				if len(line) == 0 {
+				matches := r.FindSubmatch(line)
+				if matches == nil {
 					continue
 				}
-				if !bytes.HasPrefix(line, []byte("INFO")) {
-					continue
-				}
-				prefix := "INFO - xxxx-xx-xx xx:xx:xx "
-				if len(line) <= len(prefix) {
-					continue
-				}
-				line = line[len(prefix):]
-				token := " --> "
-				i := bytes.Index(line, []byte(token))
-				if i == -1 {
-					continue
-				}
-				left, right := line[:i], line[i+len(token):]
-				token = "->"
-				i = bytes.Index(left, []byte(token))
-				if i == -1 {
-					log.Println("split module/action not expected", left)
-					continue
-				}
-				module, action := string(left[:i]), string(left[i+len(token):])
-				// must confirm
-				module = strings.ToLower(module)
+				module, action, body := string(matches[1]), string(matches[2]), matches[3]
+				ma := strings.ToLower(module + "/" + action)
 				// 不在rates配置里就剔除
-				if _, ok := conf.Rates[module]; !ok {
-					continue
-				}
-				// 不在rates配置里就剔除
-				if _, ok := conf.Rates[module][action]; !ok {
+				if _, ok := conf.Rates[ma]; !ok {
 					continue
 				}
 				_reqs := reqss[fpos]
 				if _reqs == nil {
-					_reqs = make(map[ModuleAction][][]byte)
+					_reqs = make(map[string][][]byte)
 					reqss[fpos] = _reqs
-				}
-				ma := ModuleAction{
-					Module: module,
-					Action: action,
 				}
 				if len(_reqs[ma]) >= conf.Vars.Total {
 					continue
 				}
-				_reqs[ma] = append(_reqs[ma], []byte(right))
+				_reqs[ma] = append(_reqs[ma], body)
 			}
 		}(fpos)
 	}
@@ -178,15 +143,9 @@ func loadData(f string) {
 		}
 	}
 
-	for module, vs := range conf.Rates {
-		for action, rate := range vs {
-			ma := ModuleAction{
-				Module: module,
-				Action: action,
-			}
-			log.Printf("module: %s, action: %s, num: %d, rate: %d",
-				module, action, len(reqs[ma]), rate)
-		}
+	for ma, rate := range conf.Rates {
+		log.Printf("ma: %s, num: %d, rate: %d",
+			ma, len(reqs[ma]), rate)
 	}
 
 	// if need shuffle reqs?
@@ -204,7 +163,7 @@ func loadData(f string) {
 
 func initCnts() {
 	for _, code := range codes {
-		m := make(map[ModuleAction]*uint32)
+		m := make(map[string]*uint32)
 		for ma := range reqs {
 			var i uint32
 			m[ma] = &i
@@ -216,7 +175,7 @@ func initCnts() {
 	}
 }
 
-func pushCh(ma ModuleAction, data []byte) {
+func pushCh(ma string, data []byte) {
 	select {
 	case chs[ma] <- data:
 	default:
@@ -233,8 +192,8 @@ func initClient() {
 	}
 }
 
-func post(body []byte, ma ModuleAction) {
-	ips := conf.Vars.Ips[ma.Module]
+func post(body []byte, ma string) {
+	ips := conf.Vars.Ips
 	if len(ips) == 0 {
 		atomic.AddUint32(cnts[OTHER][ma], 1)
 		pushCh(ma, []byte(fmt.Sprintf("post no ip found, body: %s, ma: %s", body, ma)))
@@ -242,7 +201,7 @@ func post(body []byte, ma ModuleAction) {
 	}
 
 	ip := ips[rand.Intn(len(ips))]
-	uri := fmt.Sprintf("http://%s/%s/%s", ip, ma.Module, ma.Action)
+	uri := fmt.Sprintf("http://%s/%s", ip, ma)
 	req, err := http.NewRequest(http.MethodPost, uri, bytes.NewReader(body))
 	if err != nil {
 		atomic.AddUint32(cnts[OTHER][ma], 1)
@@ -312,12 +271,11 @@ func post(body []byte, ma ModuleAction) {
 	}
 }
 
-func tick(percent int) {
+func tick(num int, times float64) {
 	for ma, vs := range reqs {
-		go func(ma ModuleAction, vs [][]byte) {
-			module, action := ma.Module, ma.Action
-			rate := conf.Rates[module][action]
-			rate = rate * percent / 100
+		go func(ma string, vs [][]byte) {
+			rate := conf.Rates[ma]
+			rate = int(times / float64(num) * float64(rate))
 			if rate <= 0 {
 				log.Fatal("rate not expect error")
 			}
@@ -342,13 +300,11 @@ func tick(percent int) {
 }
 
 func logerr() {
-	sortedMA := []ModuleAction{}
+	sortedMA := []string{}
 	for ma := range reqs {
 		sortedMA = append(sortedMA, ma)
 	}
-	sort.Slice(sortedMA, func(i, j int) bool {
-		return sortedMA[i].String() < sortedMA[j].String()
-	})
+	sort.Strings(sortedMA)
 
 	tickNum := 0
 	step := 3
@@ -391,10 +347,13 @@ func init() {
 func main() {
 	var f string
 	flag.StringVar(&f, "f", "api.log", "api log file, seperate by ','")
-	var per int
-	flag.IntVar(&per, "per", 100, "choose percent")
+	var num int
+	flag.IntVar(&num, "num", 1, "choose number of tester")
+	var times float64
+	flag.Float64Var(&times, "times", 1, "choose times")
 	var dur string
 	flag.StringVar(&dur, "dur", "30s", "time duration")
+
 	flag.Parse()
 
 	parseConf()
@@ -405,7 +364,7 @@ func main() {
 
 	initClient()
 
-	go tick(per)
+	go tick(num, times)
 
 	go logerr()
 
